@@ -1,0 +1,150 @@
+/* ============================================================
+   WindWise Design Tokens & Global Styles
+   Dark midnight-navy base, electric-lime/teal accents
+   ============================================================ */
+
+:root {
+  /* Colour tokens */
+  --color-bg-base: #0a1628;
+  --color-bg-surface: #0f2040;
+  --color-bg-card: #142a50;
+  --color-bg-elevated: #1a3360;
+  --color-border: #1e3d6e;
+  --color-border-subtle: #152d55;
+
+  /* Accent colours */
+  --color-lime: #a3e635;
+  --color-lime-dim: #6ea832;
+  --color-teal: #22d3ee;
+  --color-teal-dim: #0891b2;
+  --color-amber: #f59e0b;
+  --color-red: #ef4444;
+  --color-red-dim: #991b1b;
+  --color-green: #22c55e;
+  --color-green-dim: #15803d;
+
+  /* Typography */
+  --color-text-primary: #f0f4ff;
+  --color-text-secondary: #8ba3c7;
+  --color-text-muted: #4e6a8f;
+  --color-text-accent: #a3e635;
+  --color-text-teal: #22d3ee;
+
+  /* Fonts */
+  --font-sans: 'Inter', 'Segoe UI', system-ui, -apple-system, sans-serif;
+  --font-mono: 'JetBrains Mono', 'Fira Code', 'Consolas', monospace;
+
+  /* Spacing */
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-8: 32px;
+  --space-10: 40px;
+  --space-12: 48px;
+
+  /* Border radius */
+  --radius-sm: 4px;
+  --radius-md: 8px;
+  --radius-lg: 12px;
+  --radius-xl: 16px;
+
+  /* Shadows */
+  --shadow-card: 0 4px 24px rgba(0, 0, 0, 0.4), 0 1px 4px rgba(0, 0, 0, 0.3);
+  --shadow-elevated: 0 8px 32px rgba(0, 0, 0, 0.5);
+
+  /* Chart colours */
+  --chart-actual: #22d3ee;
+  --chart-forecast: #a3e635;
+  --chart-error-pos: #f59e0b;
+  --chart-error-neg: #60a5fa;
+  --chart-grid: #1e3d6e;
+}
+
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  font-size: 16px;
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-sans);
+  background: var(--color-bg-base);
+  color: var(--color-text-primary);
+  line-height: 1.6;
+  min-height: 100vh;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  /* Subtle grid background pattern */
+  background-image:
+    linear-gradient(rgba(30, 61, 110, 0.15) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(30, 61, 110, 0.15) 1px, transparent 1px);
+  background-size: 32px 32px;
+}
+
+#root {
+  display: flex;
+  min-height: 100vh;
+}
+
+/* Typography */
+h1, h2, h3, h4, h5, h6 {
+  line-height: 1.2;
+  font-weight: 600;
+  color: var(--color-text-primary);
+}
+
+a {
+  color: var(--color-teal);
+  text-decoration: none;
+}
+a:hover {
+  text-decoration: underline;
+}
+
+code, pre {
+  font-family: var(--font-mono);
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+::-webkit-scrollbar-track {
+  background: var(--color-bg-base);
+}
+::-webkit-scrollbar-thumb {
+  background: var(--color-border);
+  border-radius: 3px;
+}
+::-webkit-scrollbar-thumb:hover {
+  background: var(--color-teal-dim);
+}
+
+/* Focus visible */
+*:focus-visible {
+  outline: 2px solid var(--color-teal);
+  outline-offset: 2px;
+  border-radius: var(--radius-sm);
+}
+
+/* Utilities */
+.sr-only {
+  position: absolute;
+  width: 1px;
+  height: 1px;
+  padding: 0;
+  margin: -1px;
+  overflow: hidden;
+  clip: rect(0, 0, 0, 0);
+  white-space: nowrap;
+  border: 0;
+}

@@ -1,0 +1,13 @@
+fastapi
+uvicorn[standard]
+httpx
+pandas
+numpy
+python-dateutil
+pytz
+pydantic
+pydantic-settings
+python-dotenv
+pytest
+pytest-asyncio
+anyio[trio]
