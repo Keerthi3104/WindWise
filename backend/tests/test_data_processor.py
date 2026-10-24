@@ -50,6 +50,17 @@ def make_forecast(settlement_date="2026-01-15", period=1, generation=1100.0,
     }
 
 
+def make_real_windfor(start_time="2026-01-15T08:00:00Z", generation=12500.0,
+                      publish_time="2026-01-14T07:30:00Z"):
+    """Representative real Elexon BMRS WINDFOR/stream item (no settlementDate/Period)."""
+    return {
+        "dataset": "WINDFOR",
+        "startTime": start_time,
+        "publishTime": publish_time,
+        "generation": generation,
+    }
+
+
 # ── Cutoff tests ──────────────────────────────────────────────────────────────
 
 class TestCutoff:
@@ -308,3 +319,93 @@ class TestForecastHistory:
         assert abs(eligible[0]["forecast_mw"] - 900.0) < 0.01
         assert len(not_eligible) == 1
         assert abs(not_eligible[0]["forecast_mw"] - 1100.0) < 0.01
+
+
+# ── Regression tests for real Elexon WINDFOR stream schema ────────────────────
+
+class TestRealWindforSchema:
+    def test_hourly_forecast_expands_to_two_periods(self):
+        # Hourly forecast at 08:00 UTC covers SP17 (08:00-08:30) and SP18 (08:30-09:00)
+        raw = [make_real_windfor(start_time="2026-01-15T08:00:00Z", generation=12500.0)]
+        df = build_forecasts_df(raw)
+        assert len(df) == 2
+        periods = sorted(df["period"].tolist())
+        assert periods == [17, 18]
+        assert df["forecast_mw"].tolist() == [12500.0, 12500.0]
+        assert df["delivery_date"].iloc[0] == date(2026, 1, 15)
+
+    def test_half_hourly_forecast_maps_to_single_period(self):
+        # Forecast with startTime at 08:30 UTC maps to SP18 (8*2 + 2)
+        raw = [make_real_windfor(start_time="2026-01-15T08:30:00Z", generation=13000.0)]
+        df = build_forecasts_df(raw)
+        assert len(df) == 1
+        assert df["period"].iloc[0] == 18
+        assert df["forecast_mw"].iloc[0] == 13000.0
+
+    def test_cutoff_strict_boundary(self):
+        # Delivery date 2026-01-15: cutoff is 2026-01-14 09:20:00 UTC
+        raw = [
+            # Published before cutoff: eligible
+            make_real_windfor(publish_time="2026-01-14T07:30:00Z", generation=10000.0),
+            # Exactly at cutoff: eligible
+            make_real_windfor(publish_time="2026-01-14T09:20:00Z", generation=11000.0),
+            # After cutoff: ineligible (too late)
+            make_real_windfor(publish_time="2026-01-14T09:30:00Z", generation=12000.0),
+            make_real_windfor(publish_time="2026-01-15T02:30:00Z", generation=13000.0),
+        ]
+        df = build_forecasts_df(raw)
+        selected = select_eligible_forecasts(df)
+        assert len(selected) == 2  # SP17 and SP18
+        # Should pick the 09:20:00Z forecast (latest eligible before cutoff)
+        row_sp17 = selected[selected["period"] == 17].iloc[0]
+        assert row_sp17["eligible_forecast_mw"] == 11000.0
+        assert row_sp17["eligible_publish_time"] == datetime(2026, 1, 14, 9, 20, tzinfo=timezone.utc)
+
+    def test_end_to_end_matching_with_fuelhh(self):
+        # Real WINDFOR stream record matched with real FUELHH record
+        windfor_raw = [
+            make_real_windfor(start_time="2026-01-15T08:00:00Z", generation=12000.0,
+                              publish_time="2026-01-14T07:30:00Z"),
+        ]
+        fuelhh_raw = [
+            make_actual(settlement_date="2026-01-15", period=17, generation=10000.0),
+            make_actual(settlement_date="2026-01-15", period=18, generation=11000.0),
+        ]
+        df_act = build_actuals_df(fuelhh_raw)
+        df_fc = build_forecasts_df(windfor_raw)
+        df_sel = select_eligible_forecasts(df_fc)
+        merged = merge_data(df_act, df_sel)
+
+        assert len(merged) == 2
+        assert merged["matched"].all()
+
+        row17 = merged[merged["period"] == 17].iloc[0]
+        assert row17["actual_mw"] == 10000.0
+        assert row17["eligible_forecast_mw"] == 12000.0
+        assert row17["signed_error_mw"] == 2000.0  # Overforecast (+2000)
+        assert row17["abs_error_mw"] == 2000.0
+
+        row18 = merged[merged["period"] == 18].iloc[0]
+        assert row18["actual_mw"] == 11000.0
+        assert row18["eligible_forecast_mw"] == 12000.0
+        assert row18["signed_error_mw"] == 1000.0
+        assert row18["abs_error_mw"] == 1000.0
+
+    def test_out_of_january_records_excluded(self):
+        raw = [
+            make_real_windfor(start_time="2025-12-31T23:00:00Z"),
+            make_real_windfor(start_time="2026-02-01T00:00:00Z"),
+        ]
+        df = build_forecasts_df(raw)
+        assert df.empty
+
+    def test_corrupt_records_rejected_safely(self):
+        raw = [
+            {"dataset": "WINDFOR"},  # Missing all required
+            {"dataset": "WINDFOR", "startTime": "invalid-date", "generation": 100, "publishTime": "2026-01-01T00:00:00Z"},
+            {"dataset": "WINDFOR", "startTime": "2026-01-15T08:00:00Z", "generation": "not-a-number", "publishTime": "2026-01-01T00:00:00Z"},
+            {"dataset": "WINDFOR", "startTime": "2026-01-15T08:00:00Z", "generation": 1000, "publishTime": None},
+        ]
+        df = build_forecasts_df(raw)
+        assert df.empty
+

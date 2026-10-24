@@ -92,55 +92,96 @@ def build_actuals_df(raw: list[dict]) -> pd.DataFrame:
     Convert raw FUELHH WIND records to a clean DataFrame.
 
     Expected raw fields per record:
-      settlementDate, settlementPeriod, generation, publishTime, fuelType
-
-    Returns DataFrame with index-friendly columns and UTC-aware timestamps.
-    Only fuelType==WIND records are retained (API should already filter but
-    we double-check).
+      settlementDate, settlementPeriod, generation, publishTime, fuelType, startTime
+    Only fuelType==WIND records are retained.
     """
     if not raw:
         logger.warning("No FUELHH records received; returning empty DataFrame.")
         return pd.DataFrame()
 
-    df = pd.DataFrame(raw)
+    # Diagnostic logging: sample keys and safely truncated record
+    sample_keys = list(raw[0].keys())
+    safe_sample = {k: str(raw[0][k])[:50] for k in sample_keys}
+    logger.info("FUELHH raw stream inspection: count=%d, keys=%s, sample=%s", len(raw), sample_keys, safe_sample)
 
-    # Keep only WIND records
-    if "fuelType" in df.columns:
-        df = df[df["fuelType"].str.upper() == "WIND"].copy()
-    else:
-        logger.warning("No fuelType column in FUELHH response.")
-
-    required = {"settlementDate", "settlementPeriod", "generation"}
-    missing = required - set(df.columns)
-    if missing:
-        logger.error("FUELHH response missing columns: %s", missing)
-        return pd.DataFrame()
-
-    df["settlementDate"] = df["settlementDate"].apply(_parse_date)
-    df["settlementPeriod"] = pd.to_numeric(df["settlementPeriod"], errors="coerce")
-    df["actual_mw"] = pd.to_numeric(df["generation"], errors="coerce")
-    df["publishTime"] = df.get("publishTime", pd.Series([None] * len(df))).apply(
-        _parse_ts
-    )
-
-    # Filter to January 2026
     jan_start = date(2026, 1, 1)
     jan_end = date(2026, 1, 31)
-    df = df[
-        df["settlementDate"].apply(lambda d: d is not None and jan_start <= d <= jan_end)
-    ].copy()
 
-    # Remove duplicates: keep the latest publishTime for each interval
-    df = df.sort_values("publishTime", na_position="first")
-    df = df.drop_duplicates(
-        subset=["settlementDate", "settlementPeriod"], keep="last"
+    parsed_rows = []
+    skipped_fuel = 0
+    skipped_gen = 0
+    skipped_time = 0
+    skipped_out_of_range = 0
+
+    for item in raw:
+        fuel = str(item.get("fuelType", "")).upper()
+        if fuel and fuel != "WIND":
+            skipped_fuel += 1
+            continue
+
+        gen = item.get("generation")
+        if gen is None:
+            skipped_gen += 1
+            continue
+        try:
+            gen_val = float(gen)
+        except (ValueError, TypeError):
+            skipped_gen += 1
+            continue
+
+        pub_time = _parse_ts(item.get("publishTime"))
+
+        # Determine delivery_date and period
+        deliv_date = _parse_date(item.get("settlementDate"))
+        period_raw = item.get("settlementPeriod")
+        period_val = None
+        if period_raw is not None:
+            try:
+                period_val = int(period_raw)
+            except (ValueError, TypeError):
+                pass
+
+        # Fallback to startTime if needed
+        if (not deliv_date or period_val is None) and "startTime" in item:
+            st = _parse_ts(item.get("startTime"))
+            if st:
+                if not deliv_date:
+                    deliv_date = st.date()
+                if period_val is None:
+                    period_val = st.hour * 2 + (st.minute // 30) + 1
+
+        if not deliv_date or period_val is None or not (1 <= period_val <= 50):
+            skipped_time += 1
+            continue
+
+        if not (jan_start <= deliv_date <= jan_end):
+            skipped_out_of_range += 1
+            continue
+
+        parsed_rows.append({
+            "delivery_date": deliv_date,
+            "period": period_val,
+            "actual_mw": gen_val,
+            "actual_publish_time": pub_time,
+        })
+
+    if not parsed_rows:
+        logger.warning(
+            "FUELHH parsing resulted in 0 rows. Dropped: non_wind=%d, gen=%d, time=%d, out_of_range=%d",
+            skipped_fuel, skipped_gen, skipped_time, skipped_out_of_range
+        )
+        return pd.DataFrame()
+
+    df = pd.DataFrame(parsed_rows)
+    # Deduplication: keep latest publishTime for each interval
+    df = df.sort_values("actual_publish_time", na_position="first")
+    df = df.drop_duplicates(subset=["delivery_date", "period"], keep="last")
+    df = df.sort_values(["delivery_date", "period"]).reset_index(drop=True)
+
+    logger.info(
+        "FUELHH actuals parsed successfully: raw=%d -> unique_intervals=%d (Jan 2026). Filtered non_wind=%d",
+        len(raw), len(df), skipped_fuel
     )
-
-    df = df.rename(columns={"settlementDate": "delivery_date", "settlementPeriod": "period"})
-    df = df[["delivery_date", "period", "actual_mw", "publishTime"]].reset_index(drop=True)
-    df = df.rename(columns={"publishTime": "actual_publish_time"})
-
-    logger.info("Actuals DataFrame: %d intervals", len(df))
     return df
 
 
@@ -148,55 +189,145 @@ def build_forecasts_df(raw: list[dict]) -> pd.DataFrame:
     """
     Convert raw WINDFOR forecast records to a clean DataFrame.
 
-    Expected raw fields per record:
-      settlementDate, settlementPeriod, generation, publishTime, startTime
-
-    Returns DataFrame with all available forecast vintages for January 2026
-    delivery intervals. Does NOT apply the cutoff filter here — that is done
-    in select_eligible_forecasts().
+    Real Elexon BMRS WINDFOR stream response schema:
+      {'dataset': 'WINDFOR', 'publishTime': '...', 'startTime': '...', 'generation': ...}
+    Does NOT contain 'settlementDate' or 'settlementPeriod'.
+    - 'startTime' is an hourly ISO timestamp (e.g., '2026-01-15T08:00:00Z').
+    - Each 1-hour forecast applies to two half-hour settlement periods:
+      SP 2*H + 1 (e.g. 08:00 -> SP 17) and SP 2*H + 2 (e.g. 08:30 -> SP 18).
+    - If a record explicitly provides 'settlementDate' and 'settlementPeriod',
+      those are respected directly.
+    - Preserves all forecast vintages published for January 2026 delivery intervals.
     """
     if not raw:
         logger.warning("No WINDFOR records received; returning empty DataFrame.")
         return pd.DataFrame()
 
-    df = pd.DataFrame(raw)
+    # Diagnostic logging: sample keys and safely truncated record
+    sample_keys = list(raw[0].keys())
+    safe_sample = {k: str(raw[0][k])[:50] for k in sample_keys}
+    logger.info("WINDFOR raw stream inspection: count=%d, keys=%s, sample=%s", len(raw), sample_keys, safe_sample)
 
-    required = {"settlementDate", "settlementPeriod", "generation", "publishTime"}
-    missing = required - set(df.columns)
-    if missing:
-        logger.error("WINDFOR response missing columns: %s", missing)
-        return pd.DataFrame()
-
-    df["settlementDate"] = df["settlementDate"].apply(_parse_date)
-    df["settlementPeriod"] = pd.to_numeric(df["settlementPeriod"], errors="coerce")
-    df["forecast_mw"] = pd.to_numeric(df["generation"], errors="coerce")
-    df["publish_time"] = df["publishTime"].apply(_parse_ts)
-
-    if "startTime" in df.columns:
-        df["start_time"] = df["startTime"].apply(_parse_ts)
-    else:
-        df["start_time"] = None
-
-    # Keep only January 2026 delivery intervals
     jan_start = date(2026, 1, 1)
     jan_end = date(2026, 1, 31)
-    df = df[
-        df["settlementDate"].apply(lambda d: d is not None and jan_start <= d <= jan_end)
-    ].copy()
 
-    df = df.rename(
-        columns={"settlementDate": "delivery_date", "settlementPeriod": "period"}
+    parsed_rows = []
+    skipped_gen = 0
+    skipped_pub = 0
+    skipped_time = 0
+    skipped_out_of_range = 0
+
+    for item in raw:
+        gen = item.get("generation")
+        if gen is None:
+            skipped_gen += 1
+            continue
+        try:
+            gen_val = float(gen)
+        except (ValueError, TypeError):
+            skipped_gen += 1
+            continue
+
+        pub_time = _parse_ts(item.get("publishTime"))
+        if not pub_time:
+            skipped_pub += 1
+            continue
+
+        # Case 1: Record explicitly contains settlementDate & settlementPeriod
+        if "settlementDate" in item and "settlementPeriod" in item:
+            deliv_date = _parse_date(item.get("settlementDate"))
+            period_raw = item.get("settlementPeriod")
+            try:
+                period_val = int(period_raw)
+            except (ValueError, TypeError):
+                period_val = None
+
+            if not deliv_date or period_val is None or not (1 <= period_val <= 50):
+                skipped_time += 1
+                continue
+
+            if not (jan_start <= deliv_date <= jan_end):
+                skipped_out_of_range += 1
+                continue
+
+            st = _parse_ts(item.get("startTime")) if "startTime" in item else None
+            parsed_rows.append({
+                "delivery_date": deliv_date,
+                "period": period_val,
+                "forecast_mw": gen_val,
+                "publish_time": pub_time,
+                "start_time": st,
+            })
+            continue
+
+        # Case 2: Record contains startTime (standard WINDFOR stream format)
+        st_raw = item.get("startTime")
+        if not st_raw:
+            skipped_time += 1
+            continue
+
+        st = _parse_ts(st_raw)
+        if not st:
+            skipped_time += 1
+            continue
+
+        deliv_date = st.date()
+        if not (jan_start <= deliv_date <= jan_end):
+            skipped_out_of_range += 1
+            continue
+
+        hour = st.hour
+        minute = st.minute
+
+        # National Grid ESO WINDFOR hourly forecasts (minute == 0)
+        # 1 hour covers two half-hour settlement periods (SP 2*H + 1 and SP 2*H + 2)
+        if minute == 0:
+            sp1 = hour * 2 + 1
+            sp2 = hour * 2 + 2
+            for sp in (sp1, sp2):
+                parsed_rows.append({
+                    "delivery_date": deliv_date,
+                    "period": sp,
+                    "forecast_mw": gen_val,
+                    "publish_time": pub_time,
+                    "start_time": st,
+                })
+        elif minute == 30:
+            sp = hour * 2 + 2
+            parsed_rows.append({
+                "delivery_date": deliv_date,
+                "period": sp,
+                "forecast_mw": gen_val,
+                "publish_time": pub_time,
+                "start_time": st,
+            })
+        else:
+            sp = min(48, max(1, hour * 2 + (minute // 30) + 1))
+            parsed_rows.append({
+                "delivery_date": deliv_date,
+                "period": sp,
+                "forecast_mw": gen_val,
+                "publish_time": pub_time,
+                "start_time": st,
+            })
+
+    if not parsed_rows:
+        logger.warning(
+            "WINDFOR parsing resulted in 0 rows. Rejections: gen=%d, pub=%d, time=%d, out_of_range=%d",
+            skipped_gen, skipped_pub, skipped_time, skipped_out_of_range
+        )
+        return pd.DataFrame()
+
+    df = pd.DataFrame(parsed_rows)
+
+    # Deterministic deduplication: if multiple identical (delivery_date, period, publish_time) rows exist, keep last
+    df = df.sort_values("publish_time", na_position="first")
+    df = df.drop_duplicates(subset=["delivery_date", "period", "publish_time"], keep="last")
+
+    logger.info(
+        "WINDFOR parsed successfully: raw=%d -> valid_intervals=%d (Jan 2026). Dropped: gen=%d, pub=%d, time=%d, out_of_range=%d",
+        len(raw), len(df), skipped_gen, skipped_pub, skipped_time, skipped_out_of_range
     )
-    df = df[["delivery_date", "period", "forecast_mw", "publish_time", "start_time"]].copy()
-
-    # Drop records with unparseable publish_time (cannot determine eligibility)
-    before = len(df)
-    df = df.dropna(subset=["publish_time"]).copy()
-    after = len(df)
-    if before != after:
-        logger.warning("Dropped %d WINDFOR records with null publishTime", before - after)
-
-    logger.info("Forecasts DataFrame: %d records for Jan 2026 delivery", len(df))
     return df
 
 
@@ -212,6 +343,7 @@ def select_eligible_forecasts(forecasts_df: pd.DataFrame) -> pd.DataFrame:
     included (handled in merge_data).
     """
     if forecasts_df.empty:
+        logger.warning("select_eligible_forecasts called with empty forecasts_df")
         return pd.DataFrame()
 
     df = forecasts_df.copy()
@@ -221,6 +353,11 @@ def select_eligible_forecasts(forecasts_df: pd.DataFrame) -> pd.DataFrame:
 
     # Keep only eligible forecasts
     eligible = df[df["publish_time"] <= df["cutoff"]].copy()
+
+    logger.info(
+        "Cutoff evaluation (D-1 %02d:%02d UTC): total_vintages=%d, eligible_vintages=%d, post_cutoff_vintages=%d",
+        CUTOFF_HOUR, CUTOFF_MINUTE, len(df), len(eligible), len(df) - len(eligible)
+    )
 
     if eligible.empty:
         logger.warning("No eligible forecasts found after cutoff filter.")
@@ -239,7 +376,7 @@ def select_eligible_forecasts(forecasts_df: pd.DataFrame) -> pd.DataFrame:
         }
     )
 
-    logger.info("Selected eligible forecasts: %d intervals", len(selected))
+    logger.info("Selected latest eligible forecast for %d unique intervals", len(selected))
     return selected[
         ["delivery_date", "period", "eligible_forecast_mw", "eligible_publish_time",
          "eligible_start_time", "cutoff_time"]
@@ -294,10 +431,12 @@ def merge_data(actuals_df: pd.DataFrame, selected_df: pd.DataFrame) -> pd.DataFr
     merged["matched"] = both_present
 
     merged = merged.sort_values(["delivery_date", "period"]).reset_index(drop=True)
+    n_act = int(merged["has_actual"].sum())
+    n_fc = int(merged["has_forecast"].sum())
+    n_match = int(merged["matched"].sum())
     logger.info(
-        "Merged: %d total intervals, %d matched",
-        len(merged),
-        merged["matched"].sum(),
+        "Merged data summary: total_intervals=%d, actuals_present=%d, forecasts_present=%d, matched_pairs=%d",
+        len(merged), n_act, n_fc, n_match
     )
     return merged
 
@@ -452,7 +591,8 @@ def get_forecast_history(
     subset = forecasts_df[mask].copy()
 
     records = []
-    for _, row in subset.sort_values("publish_time").iterrows():
+    subset = subset.sort_values("publish_time").drop_duplicates(subset=["publish_time"], keep="last")
+    for _, row in subset.iterrows():
         pt = row["publish_time"]
         eligible = bool(pt <= cutoff) if pt is not None else False
         records.append(
